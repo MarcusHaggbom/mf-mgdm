@@ -1,0 +1,3 @@
+LATEX_INSTALLED: bool = True
+MAIN_SEED: int = 12345
+
