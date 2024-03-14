@@ -1,6 +1,7 @@
 # Mean-Field Microcanonical Gradient Descent
 
-Code to replicate results from the paper "Mean-Field Microcanonical Gradient Descent" by Marcus Häggbom, Morten Karlsmark and Joakim Andén (2024).
+Code to replicate results from the paper "Mean-Field Microcanonical Gradient Descent" by Marcus Häggbom, Morten 
+Karlsmark and Joakim Andén (2024), available at https://arxiv.org/abs/2403.08362.
 
 Run frontend.py to generate plots.
 
