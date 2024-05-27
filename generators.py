@@ -248,6 +248,7 @@ class RevKLLoss:
 
     def through_descent_batched(self, generator: GeneratorABC, batch_size: int, x0: torch.Tensor,
                                 include_entropy_and_ll=True):
+        # batch_size must not be less than mean-field parameter N
         x = x0.clone()
         kl_losses = torch.zeros((generator.grad_steps + 1, 3) if include_entropy_and_ll else generator.grad_steps + 1)
         N = x0.shape[0]
@@ -265,8 +266,8 @@ class RevKLLoss:
             kl_losses[k] /= N
             bar.set_description(f'KL: {kl_losses[k, 0 if include_entropy_and_ll else None]:.2f}')
             tqdm.write(f'KL loss {kl_losses[k, 0 if include_entropy_and_ll else None]:.2f}')
-        print(f'Minimum KL: {kl_losses[:, 0].min():.2f} at step {kl_losses[:, 0].argmin()}')
-        print(f'Final KL: {kl_losses[-1, 0]:.2f}')
+        print(f'Minimum KL: {kl_losses[:, 0 if include_entropy_and_ll else None].min():.2f} at step {kl_losses[:, 0].argmin()}')
+        print(f'Final KL: {kl_losses[-1, 0 if include_entropy_and_ll else None]:.2f}')
         return kl_losses
 
     def to(self, device):
@@ -276,3 +277,32 @@ class RevKLLoss:
     def cpu(self):
         self.device = torch.device('cpu')
         return self
+
+
+class EntropyCalculator:
+    def __init__(self, latent_model: Model):
+        self.latent_model = latent_model
+
+    def through_descent(self, generator: GeneratorABC, batch_size: int, x0: torch.Tensor):
+        # batch_size must not be less than mean-field parameter N
+        x = x0.clone()
+        entropies = torch.zeros(generator.grad_steps + 1)
+        N = x0.shape[0]
+        assert N % batch_size == 0
+        entropies[0] = - self.latent_model.loglikelihood(x0).mean(0).detach().cpu()
+        bar = trange(generator.grad_steps, desc='Entropy: ')
+        for k in bar:
+            log_det_contrs = 0.
+            for ii, i in enumerate(range(0, N, batch_size)):
+                x_i = x[i:i + batch_size]
+                x_i, log_det_contr = generator.descend(x_i, include_log_det=True, steps=1)
+                x[i:i + batch_size] = x_i
+                log_det_contrs += log_det_contr.squeeze().sum().detach().cpu()
+            entropies[k + 1] = entropies[k] + log_det_contrs / N
+            bar.set_description(f'Entropy: {entropies[k]:.2f}')
+            tqdm.write(f'Entropy {entropies[k]:.2f}')
+        print(f'Initial entropy: {entropies[0]:.2f}')
+        print(f'Maximum entropy: {entropies.max():.2f} at step {entropies.argmax()}')
+        print(f'Minimum entropy: {entropies.min():.2f} at step {entropies.argmin()}')
+        print(f'Final entropy: {entropies[-1]:.2f}')
+        return entropies

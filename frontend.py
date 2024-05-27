@@ -5,15 +5,17 @@ import torch
 import utils
 import energies
 import models
-from generators import Generator, GeneratorMF, RevKLLoss
+from generators import Generator, GeneratorMF, RevKLLoss, EntropyCalculator
 import plot
 import pandas as pd
+import time
 
 PCA_DIST_SEED = (1, config.MAIN_SEED)
 LATENT_SEED = (2, config.MAIN_SEED)
 TARGET_ENERGY_SEED = (3, config.MAIN_SEED)
 GARCH_SEED = (4, config.MAIN_SEED)
 PERT_SEED = (5, config.MAIN_SEED)
+TS_SLICE_SEED = (6, config.MAIN_SEED)
 
 
 def ar1_experiment():
@@ -55,8 +57,8 @@ def ar1_experiment():
             np.save(filepath, kl_losses)
         kl_losses_list.append(kl_losses)
 
-    plot.kl_and_parts(kl_losses_list[0], OUT_DIR, suffix='-regular')
-    plot.kl_and_parts_in_same(kl_losses_list[1], OUT_DIR, suffix='-mf')
+    plot.kl_and_parts_in_same(kl_losses_list[0], OUT_DIR, suffix='-regular', figsize=(3.4, 1.5))
+    plot.kl_and_parts_in_same(kl_losses_list[1], OUT_DIR, suffix='-mf', figsize=(3.45, 1.515), adjust=3)
 
     kl_min = kl_losses_list[0][:, 0].min()
     kl_min_mf = kl_losses_list[1][:, 0].min()
@@ -76,9 +78,13 @@ def ar1_experiment():
                                 project=true_model.non_negative).to(device)
     mf_mgdm_min_kl = GeneratorMF(energy_fn, target_energy, kl_argmin_mf, grad_step_size, gpu_bs_logdet=gpu_bs_logdet,
                                  project=true_model.non_negative).to(device)
-    for gen, label, suffix in zip([mgdm_min_kl, mgdm_overfitted, mf_mgdm_min_kl],
-                                  ['MGDM', 'MGDM', 'MF-MGDM'],
-                                  ['-regular-min-kl', '-regular-overfit', '-mf-min-kl']):
+
+    label_list = [[r'$\Phi_\#p$', r'$\Phi_\#q_{' + str(kl_argmin) + '}$', r'$\Phi_\#q_0$'],
+                  [r'$\Phi_\#p$', r'$\Phi_\#q_{' + str(overfit_iterates) + '}$', r'$\Phi_\#q_0$'],
+                  [r'$\Phi_\#p$', r'$\Phi_\#\overline{q}_{' + str(kl_argmin_mf) + '}$', r'$\Phi_\#\overline{q}_0$']]
+    for gen, labels, suffix in zip([mgdm_min_kl, mgdm_overfitted, mf_mgdm_min_kl],
+                                   label_list,
+                                   ['-regular-min-kl', '-regular-overfit', '-mf-min-kl']):
         filename = f'energies--{repr(gen)}--{repr(latent_model)}--{N_gen}--{T}.npy'
         filepath = os.path.join(OUT_DIR, filename)
         if os.path.exists(filepath):
@@ -88,7 +94,7 @@ def ar1_experiment():
             model_energies = energy_fn(samples).cpu().numpy()
             np.save(filepath, model_energies)
         plot.energy_pushforward_2d([true_energies.numpy(), model_energies, latent_energies],
-                                   ['True', label, 'Latent'],
+                                   labels,
                                    OUT_DIR, suffix=suffix)
 
 
@@ -162,7 +168,7 @@ def synthetic_data_experiment(true_model: models.Model, logT: int, N_gen: int, e
             kl_losses = kl_loss_fn.through_descent_batched(gen, N_gen, latent_samples.clone(), True).numpy()
             np.save(filepath, kl_losses)
         kl_losses_list.append(kl_losses)
-    plot.compare_mf_with_regular(kl_losses_list, ('MGDM', 'MF-MGDM'), OUT_DIR)
+    plot.compare_mf_with_regular(kl_losses_list, ('MGDM', 'MF--MGDM'), OUT_DIR)
     return kl_losses_list
 
 
@@ -242,12 +248,19 @@ def evaluate_robustness(loss_fn, true_sample, gen_samples, gen_labels, out_dir):
 
 
 def real_data_experiment(dataset: str, logT_true: int, logT_gen: int, energy_cls, energy_kwargs: dict,
-                         N_gen: int, gen_kwargs: dict, check_robustness=False, init_garch=False, init_ar1garch=False):
+                         N_gen: int, gen_kwargs: dict, check_robustness=False, init_garch=False, init_ar1garch=False,
+                         n_true_samples: int = 1, compute_entropy=False):
     T_gen = 2 ** logT_gen
     T_true = 2 ** logT_true
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    true_data = torch.from_numpy(utils.load_real_data(dataset)[-T_true:]).to(torch.float32)
+    true_data_all = utils.load_real_data(dataset)
+    assert true_data_all.shape[0] >= T_true * n_true_samples, f'Not enough data for {n_true_samples}'
+    true_data_samples = true_data_all[-T_true * n_true_samples:].reshape(n_true_samples, T_true)
+    true_data = torch.from_numpy(true_data_samples[0]).to(torch.float32)
+    true_data_validation = true_data_samples[1:]
+    true_data = (true_data - true_data.mean()) / true_data.std()
+    true_data_validation = (true_data_validation - true_data_validation.mean(-1, keepdims=True)) / true_data_validation.std(-1, keepdims=True)
 
     if energy_cls == energies.ScatCovPCA:
         if not energy_kwargs['pca_model'].startswith('GARCH'):
@@ -264,7 +277,7 @@ def real_data_experiment(dataset: str, logT_true: int, logT_gen: int, energy_cls
         target_energy = energy_cls(logT_true, **energy_kwargs)(true_data)
         energy_fn = energy_cls(logT_gen, **energy_kwargs)
 
-    OUT_DIR = os.path.join('output', dataset, f'{T_true}--{repr(energy_fn)}')
+    OUT_DIR = os.path.join('output', dataset, f'{T_true}-{T_gen}-{n_true_samples}--{repr(energy_fn)}')
     os.makedirs(OUT_DIR, exist_ok=True)
 
     if init_ar1garch:
@@ -281,10 +294,7 @@ def real_data_experiment(dataset: str, logT_true: int, logT_gen: int, energy_cls
     base_generator = Generator(energy_fn, target_energy, **gen_kwargs_ex_expand).to(device)
     mf_generator = GeneratorMF(energy_fn, target_energy, **gen_kwargs_ex_expand).to(device)
     generators = [base_generator, mf_generator]
-    labels = ['MGDM', 'MF-MGDM']
-    if 'grad_step_size_expand' in gen_kwargs:
-        generators.append(GeneratorMF(energy_fn, target_energy, **gen_kwargs).to(device))
-        labels.append('eMF-MGDM')
+    labels = ['MGDM', 'MF--MGDM']
 
     samples = []
     for i, gen in enumerate(generators):
@@ -295,13 +305,33 @@ def real_data_experiment(dataset: str, logT_true: int, logT_gen: int, energy_cls
             sample = npzfile['sample']
             error = npzfile['error']
         else:
-            print(f'No previously generated samples for {filename}, generating new')
+            print(f'No previously generated samples for {filename}, generating new...')
+            t0 = time.time()
             sample, error = gen(latent_samples.clone().to(device), include_log_det=False, include_errors=True)
+            print(f'... done; generated in {time.time() - t0:.2f} s')
             sample = sample.cpu().numpy()
             np.savez(filepath, sample=sample, error=error)
         samples.append(sample)
         plot.inner_loss_though_descent(error, OUT_DIR, suffix=f'-{labels[i]}', color=f'C{i}')
         print(f'{repr(gen)} loss: {gen.loss(torch.from_numpy(sample).to(device)).mean().item()}')
+
+    if compute_entropy:
+        entropies = []
+        entropy_calculator = EntropyCalculator(latent_model)
+        for i, gen in enumerate(generators):
+            filename = f'{repr(gen)}--{repr(latent_model)}--{N_gen}-entropy.npy'
+            filepath = os.path.join(OUT_DIR, filename)
+            if os.path.exists(filepath):
+                entropy = np.load(filepath)
+            else:
+                print(f'No previously computed entropy for {filename}, computing new...')
+                t0 = time.time()
+                entropy = entropy_calculator.through_descent(gen, N_gen, latent_samples.clone()).numpy()
+                print(f'... done; computed in {time.time() - t0:.2f} s')
+                np.save(filepath, entropy)
+            print(f'{repr(gen)} entropy: {entropy[-1]} (init {entropy[0]})')
+            entropies.append(entropy)
+        plot.only_entropies(entropies, labels, OUT_DIR)
 
     if check_robustness:
         evaluate_robustness(base_generator.loss, true_data.to(device), samples, labels, OUT_DIR)
@@ -312,67 +342,71 @@ def real_data_experiment(dataset: str, logT_true: int, logT_gen: int, energy_cls
     samples.append(garch_model.generate_sample(T_gen, N_gen))
     labels += ['GARCH']
 
-    plot.compare_with_true(true_data, samples, labels, OUT_DIR)
+    plot.compare_with_true(true_data, true_data_validation, samples, labels, OUT_DIR)
+
+    rng_slice = np.random.default_rng(TS_SLICE_SEED)
+    plot.compare_timeseries_with_true(true_data_validation, samples, rng_slice, [dataset, *labels], OUT_DIR)
 
 
 def real_data_experiments_main():
-    real_data_experiment('SP500', 12, 10, energies.ACF2,
+    real_data_experiment('SP500', 10, 10, energies.ACF2,
                          {'lags': 20},
                          1024,
-                         {'grad_steps': 20000, 'grad_step_size': 50., 'gpu_bs_gen': 1024})
-    real_data_experiment('USD5Y', 12, 10, energies.ACF2,
+                         {'grad_steps': 20000, 'grad_step_size': 50., 'gpu_bs_gen': 1024}, n_true_samples=4,
+                         compute_entropy=True)
+    real_data_experiment('USD5Y', 10, 10, energies.ACF2,
                          {'lags': 20},
                          1024,
-                         {'grad_steps': 2500, 'grad_step_size': 50., 'gpu_bs_gen': 1024})
-    real_data_experiment('USD10Y', 12, 10, energies.ACF2,
+                         {'grad_steps': 2500, 'grad_step_size': 50., 'gpu_bs_gen': 1024}, n_true_samples=4)
+    real_data_experiment('USD10Y', 10, 10, energies.ACF2,
                          {'lags': 20},
                          1024,
-                         {'grad_steps': 2500, 'grad_step_size': 50., 'gpu_bs_gen': 1024})
-    real_data_experiment('EUR5Y', 11, 10, energies.ACF2,
+                         {'grad_steps': 2500, 'grad_step_size': 50., 'gpu_bs_gen': 1024}, n_true_samples=4)
+    real_data_experiment('EUR5Y', 9, 9, energies.ACF2,
                          {'lags': 20},
                          1024,
-                         {'grad_steps': 2500, 'grad_step_size': 50., 'gpu_bs_gen': 1024})
-    real_data_experiment('EUR10Y', 11, 10, energies.ACF2,
+                         {'grad_steps': 500, 'grad_step_size': 50., 'gpu_bs_gen': 1024}, n_true_samples=4)
+    real_data_experiment('EUR10Y', 9, 9, energies.ACF2,
                          {'lags': 20},
                          1024,
-                         {'grad_steps': 5000, 'grad_step_size': 50., 'gpu_bs_gen': 1024})
+                         {'grad_steps': 500, 'grad_step_size': 50., 'gpu_bs_gen': 1024}, n_true_samples=4)
 
-    real_data_experiment('SP500', 12, 10, energies.ScatCovPCA,
+    real_data_experiment('SP500', 10, 10, energies.ScatCovPCA,
                          {'j1': 4, 'j2': 6, 'phase_shifts': 2, 'pca_model': 'GARCH(0.03,0.1,0.87)'},
                          1024,
                          {'grad_steps': 500, 'grad_step_size': 1.,
-                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11})
-    real_data_experiment('USD5Y', 12, 10, energies.ScatCovPCA,
+                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11}, n_true_samples=4)
+    real_data_experiment('USD5Y', 10, 10, energies.ScatCovPCA,
                          {'j1': 4, 'j2': 6, 'phase_shifts': 2, 'pca_model': 'GARCH(0.03,0.1,0.87)'},
                          1024,
                          {'grad_steps': 250, 'grad_step_size': 1.,
-                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11})
-    real_data_experiment('USD10Y', 12, 10, energies.ScatCovPCA,
+                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11}, n_true_samples=4)
+    real_data_experiment('USD10Y', 10, 10, energies.ScatCovPCA,
                          {'j1': 4, 'j2': 6, 'phase_shifts': 2, 'pca_model': 'GARCH(0.03,0.1,0.87)'},
                          1024,
                          {'grad_steps': 2000, 'grad_step_size': 10.,
-                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11})
-    real_data_experiment('EUR5Y', 11, 10, energies.ScatCovPCA,
+                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11}, n_true_samples=4)
+    real_data_experiment('EUR5Y', 9, 9, energies.ScatCovPCA,
                          {'j1': 4, 'j2': 6, 'phase_shifts': 2, 'pca_model': 'GARCH(0.03,0.1,0.87)'},
                          1024,
                          {'grad_steps': 1000, 'grad_step_size': 10.,
-                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11})
-    real_data_experiment('EUR10Y', 11, 10, energies.ScatCovPCA,
+                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11}, n_true_samples=4)
+    real_data_experiment('EUR10Y', 9, 9, energies.ScatCovPCA,
                          {'j1': 4, 'j2': 6, 'phase_shifts': 2, 'pca_model': 'GARCH(0.03,0.1,0.87)'},
                          1024,
                          {'grad_steps': 1000, 'grad_step_size': 10.,
-                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11})
+                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11}, n_true_samples=4)
 
-    real_data_experiment('SP500', 12, 10, energies.ScatCovPCA,
+    real_data_experiment('SP500', 10, 10, energies.ScatCovPCA,
                          {'j1': 4, 'j2': 6, 'phase_shifts': 2, 'pca_model': 'GARCH(0.03,0.1,0.87)'},
                          1024,
                          {'grad_steps': 10000, 'grad_step_size': 1.,
-                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11})
-    real_data_experiment('SP500', 12, 10, energies.ScatCovPCA,
+                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11}, n_true_samples=4)
+    real_data_experiment('SP500', 10, 10, energies.ScatCovPCA,
                          {'j1': 4, 'j2': 6, 'phase_shifts': 2, 'pca_model': 'GARCH(0.03,0.1,0.87)'},
                          1024,
-                         {'grad_steps': 2500, 'grad_step_size': 1.,
-                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11}, init_garch=True)
+                         {'grad_steps': 25000, 'grad_step_size': 0.1,
+                          'gpu_bs_gen': 1024, 'gpu_bs_logdet': 11}, n_true_samples=4, init_garch=True)
 
 
 def main():
