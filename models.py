@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import scipy
 import pandas as pd
@@ -7,6 +8,8 @@ import arch
 from abc import ABC, abstractmethod
 import utils
 import re
+from tqdm import trange
+import numba
 
 
 def float_f(x: float) -> str:
@@ -83,6 +86,15 @@ class Gaussian(Model):
 
     def clone(self):
         return Gaussian(self.seed, self._mean, self._std)
+
+
+class Gaussian2D(Gaussian):
+    def generate_sample(self, T, N=None):
+        shape = (T, T) if N is None else (N, T, T)
+        return self.formatted(self.rng.standard_normal(shape)) * self.std + self.mean
+
+    def loglikelihood(self, x):
+        return -0.5 * (((x - self.mean) ** 2 / self.std ** 2).sum((-1, -2)) + x.shape[-1] * x.shape[-2] * np.log(2. * np.pi * self.std ** 2))
 
 
 class StudentT(Model):
@@ -320,7 +332,7 @@ class ARMA(Model):
     def generate_sample(self, T, N=None):
         shape = T if N is None else (N, T)
         sample = self.arma_process.generate_sample(shape, self.sigma, distrvs=self.rng.standard_normal, axis=-1,
-                                                   burnin=T//10)
+                                                   burnin=T // 10)
         return self.formatted(sample)
 
     def loglikelihood(self, x):
@@ -644,6 +656,151 @@ class AR1GARCH(Model):
                         self.params['beta[1]'], self.params['nu'])
 
 
+@numba.jit(nopython=True)
+def ising_loop(x, N, T, steps, beta, rows, cols, thresholds):
+    for i in range(steps):
+        for n in range(N):
+            r, c = rows[i, n], cols[i, n]
+            dE = 2 * x[n, r, c] * (x[n, (r - 1) % T, c] + x[n, (r + 1) % T, c]
+                                   + x[n, r, (c - 1) % T] + x[n, r, (c + 1) % T]) * beta
+            if dE < 0 or thresholds[i, n] < np.exp(-dE):
+                x[n, r, c] *= -1
+    return x
+
+
+class Ising(Model):
+    """2d Ising model"""
+
+    def __init__(self, seed: (int, int), temperature: float = 2.2, sweeps: int = 1000, use_cache: bool = True):
+        super().__init__(seed)
+        self.temperature = temperature
+        self.sweeps = sweeps
+        self.use_cache = use_cache
+        self._sampled_from = False
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self.temperature:.2g},{self.sweeps})-{self.seed_f}'
+
+    @property
+    def beta(self):
+        return 1 / self.temperature  # beta = 1 / kT. J (exchange interaction) is set to 1.
+
+    def generate_sample(self, T, N=None):
+        if self.use_cache and self._sampled_from:
+            raise ValueError('Sampled from cache. Cannot generate new samples')
+        self._sampled_from = True
+        file_dir = os.path.join('data', 'ising')
+        os.makedirs(file_dir, exist_ok=True)
+        file_path = os.path.join(file_dir, repr(self) + f'-{T}x{T}x{N}.npy')
+
+        if os.path.exists(file_path):
+            x = np.load(file_path)
+        else:
+            x = self._generate_sample(T, N)
+            np.save(file_path, x)
+        return self.formatted(x)
+
+    def _generate_sample(self, T, N):
+        x = self.rng.choice([-1, 1], (N, T, T))
+
+        total_steps = self.sweeps * T ** 2
+        steps_per_batch = round(128 * 256 * 256 * 8 / N)
+        assert steps_per_batch > 0
+
+        for _ in trange(np.ceil(total_steps / steps_per_batch).astype(int)):
+            rows = self.rng.choice(T, (steps_per_batch, N))
+            cols = self.rng.choice(T, (steps_per_batch, N))
+            thresholds = self.rng.uniform(size=(steps_per_batch, N))
+            # t0 = time.time()
+            x = ising_loop(x, N, T, steps_per_batch, self.beta, rows, cols, thresholds)
+            # t1 = time.time()
+            # print('Frequency:', steps_per_batch / (t1 - t0))
+
+        return x
+
+    @staticmethod
+    def log_ising_partition_fn(beta, M, N):  # Kaufman 49 (also in Beale 96)
+        K = beta
+        k = np.arange(2 * N)
+        gamma = np.arccosh(np.cosh(2 * K) ** 2 / np.sinh(2 * K) - np.cos(np.pi * k / N))
+        gamma[0] = 2 * K + np.log(np.tanh(K))
+        Y1 = np.cosh(M / 2 * gamma[1::2])
+        Y2 = np.sinh(M / 2 * gamma[1::2])
+        Y3 = np.cosh(M / 2 * gamma[::2])
+        Y4 = np.sinh(M / 2 * gamma[::2])
+        log_Z = (N * M / 2 + N - 1) * np.log(2) + N * M / 2 * np.log(np.sinh(2 * K))
+        log_Z += np.log(Y1).sum() + np.log(1 + np.prod(Y2 / Y1) + np.prod(Y3 / Y1) + np.prod(Y4 / Y1))
+        return log_Z
+
+    def loglikelihood(self, x):
+        log_energy = self.beta * (x * (np.roll(x, 1, axis=-1) + np.roll(x, 1, axis=-2))).sum((-1, -2))
+        M, N = x.shape[-2:]
+        log_Z = self.log_ising_partition_fn(self.beta, M, N)
+        return log_energy - log_Z
+
+    @property
+    def mean(self):
+        return 0.
+
+    @property
+    def std(self):
+        return 1.
+
+    def clone(self):
+        return Ising(self.seed, self.temperature, self.sweeps, self.use_cache)
+
+
+class IsingRelaxed(Ising):
+    """Relaxed 2d Ising model"""
+
+    def __init__(self, seed: (int, int), temperature: float = 2.2, sweeps: int = 1000, use_cache: bool = True, alpha: float = 1.):
+        super().__init__(seed, temperature, sweeps, use_cache)
+        self.alpha = alpha
+        # self._adj_matrices_cache = {}
+        self._cov_mat_cache = {}
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self.temperature:.2g},{self.sweeps},{self.alpha})-{self.seed_f}'
+
+    @property
+    def beta(self):
+        return 1 / self.temperature  # beta = 1 / kT. J (exchange interaction) is set to 1.
+
+    def adj_matrix(self, M, N):
+        adj_mat = torch.zeros((N * M, N * M))
+        indices = torch.arange(N * M)
+        adj_mat[indices, (indices + N) % (N * M)] = 1
+        adj_mat[indices, (indices // N) * N + (indices + 1) % N] = 1
+        adj_mat = adj_mat + adj_mat.T
+        try:
+            np.linalg.cholesky(adj_mat.numpy() * self.beta + self.alpha * np.eye(N * M))
+        except np.linalg.LinAlgError:
+            raise ValueError('Matrix is not positive definite; increase alpha')
+        return adj_mat
+
+    def covariance_matrix_inv_and_logdet(self, M, N, device):
+        key = (M, N, device)
+        if key not in self._cov_mat_cache:
+            K = self.beta * self.adj_matrix(M, N)
+            cov_mat = K + self.alpha * torch.eye(K.shape[-1], device=K.device)
+            self._cov_mat_cache[key] = (torch.linalg.inv(cov_mat).to(device), torch.slogdet(cov_mat).logabsdet.item())
+        return self._cov_mat_cache[key]
+
+    def loglikelihood(self, x):
+        M, N = x.shape[-2:]
+        x_flat = x.reshape(*x.shape[:-2], M * N, 1)
+        cov_inv, cov_logdet = self.covariance_matrix_inv_and_logdet(M, N, x.device)
+        log_energy = -0.5 * (x_flat.mT @ cov_inv @ x_flat).squeeze((-1, -2))
+        log_energy += torch.log(torch.cosh(x_flat)).sum((-1, -2))
+
+        # Neural Network Renormalization group https://arxiv.org/pdf/1802.02840
+        logZ = self.log_ising_partition_fn(self.beta, M, N) + 0.5 * cov_logdet - 0.5 * M * N * (np.log(2 / np.pi) - self.alpha)
+        return log_energy - logZ
+
+    def clone(self):
+        return IsingRelaxed(self.seed, self.temperature, self.sweeps, self.use_cache, self.alpha)
+
+
 def get_maximum_entropy_model(model: Model, seed: (int, int)) -> Model:
     if model.non_negative:
         if model.mean == model.std:
@@ -654,3 +811,59 @@ def get_maximum_entropy_model(model: Model, seed: (int, int)) -> Model:
         latent_model = Gaussian(seed, model.mean, model.std)
     print('Latent model:', latent_model)
     return latent_model
+
+
+def _test():
+
+    # x = ising2d(10, 256, (12, 234), 1000, 1 / 2.2)
+    N = 16
+    # T = 256
+    # ising = Ising((12, 234), 2.4, 1024)
+    T = 32
+    ising = Ising((12, 234), 4., 1024)
+    x = ising.generate_sample(T, N)
+
+    import matplotlib.pyplot as plt
+    for y in x[:20]:
+        plt.figure()
+        plt.imshow(y)
+    plt.show()
+
+
+def _test_ising_partition():
+    import itertools
+
+    def logZ(M, N, K):
+        k = np.arange(2 * N)
+        gamma = np.arccosh(np.cosh(2 * K) ** 2 / np.sinh(2 * K) - np.cos(np.pi * k / N))
+        gamma[0] = 2 * K + np.log(np.tanh(K))
+        Y1 = np.cosh(M / 2 * gamma[1::2])
+        Y2 = np.sinh(M / 2 * gamma[1::2])
+        Y3 = np.cosh(M / 2 * gamma[::2])
+        Y4 = np.sinh(M / 2 * gamma[::2])
+        log_free_energy = (N * M / 2 + N - 1) * np.log(2) + N * M / 2 * np.log(np.sinh(2 * K))
+        log_free_energy += np.log(Y1).sum() + np.log(1 + np.prod(Y2 / Y1) + np.prod(Y3 / Y1) + np.prod(Y4 / Y1))
+        # log_free_energy += np.log(np.prod(Y1) + np.prod(Y2) + np.prod(Y3) + np.prod(Y4))
+        return log_free_energy
+
+    def logZ2(M, N, K):
+        def efn(x):
+            return - K * (x * (np.roll(x, 1, axis=-1) + np.roll(x, 1, axis=-2))).sum((-1, -2))
+        sample = np.random.choice([-1, 1], (N, M))
+        C = 1 #np.exp(-efn(sample))
+        s = 0
+        for i, a in enumerate(itertools.product([-1, 1], repeat=N*M)):
+            x = np.array(a).reshape(M, N)
+            s += np.exp(-efn(x)) / C
+        return np.log(s) + np.log(C)
+
+    for n in (2, 3, 4):
+        for temp in (1., 2., 3., 4., 5.):
+            Z1 = logZ(n, n, 1 / temp)
+            Z2 = logZ2(n, n, 1 / temp)
+            print(n, temp, Z1, Z2, Z1 - Z2)
+
+
+if __name__ == '__main__':
+    _test()
+    # _test_ising_partition()

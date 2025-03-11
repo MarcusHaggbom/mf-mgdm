@@ -3,7 +3,10 @@ import os
 import numpy as np
 import torch
 import scipy
-from kymatio.scattering1d.filter_bank import scattering_filter_factory
+from kymatio.scattering1d.filter_bank import scattering_filter_factory as filter_bank_1d
+from kymatio.scattering2d.filter_bank import filter_bank as filter_bank_2d
+from kymatio.torch import Scattering1D, Scattering2D
+from phaseharmonics2d.phase_harmonics_k_bump_isotropic_noreflect_norml import PhaseHarmonics2d
 import utils
 import scatspectra
 from models import Model
@@ -28,6 +31,66 @@ class Energy(ABC):
 
     def cpu(self):
         return self
+
+
+class LpNorm(Energy):
+    def __init__(self, p: float, dim=1):
+        self.p = p
+        self.signal_dim = dim
+
+    def __call__(self, x):
+        return (x.abs() ** self.p).mean(axis=tuple(range(-self.signal_dim, 0)))[..., None]
+
+    def __repr__(self):
+        return f'L{self.p}Norm'
+
+    @property
+    def dim(self):
+        return 1
+
+
+class IsingStat2d(Energy):
+    def __call__(self, x):
+        return (x * (torch.roll(x, 1, dims=-1) + torch.roll(x, 1, dims=-2))).mean((-1, -2))[..., None]
+
+    def __repr__(self):
+        return 'IsingStat2d'
+
+    @property
+    def dim(self):
+        return 1
+
+
+class Square(Energy):
+    def __init__(self, signal_size, dim=1):
+        self.signal_size = signal_size
+        self.signal_dim = dim
+
+    def __call__(self, x):
+        return (x.abs() ** 2).reshape(*x.shape[:-self.dim], self.signal_size)
+
+    def __repr__(self):
+        return 'Square'
+
+    @property
+    def dim(self):
+        return self.signal_size
+
+
+class Abs(Energy):
+    def __init__(self, signal_size, dim=1):
+        self.signal_size = signal_size
+        self.signal_dim = dim
+
+    def __call__(self, x):
+        return (x.abs()).reshape(*x.shape[:-self.dim], self.signal_size)
+
+    def __repr__(self):
+        return 'Abs'
+
+    @property
+    def dim(self):
+        return self.signal_size
 
 
 class ACF(Energy):
@@ -66,43 +129,54 @@ class ACF2(Energy):
 
 
 class ScatABC(Energy):
-    def __init__(self, logT, j1, j2):
+    def __init__(self, logT, j1, j2, dim=1, Q=1):
         assert j1 is not None and j2 is not None
         self.j1 = j1
         self.j2 = j2
         self.logT = logT
-        self.phi, self.psi1, self.psi2 = self.get_filters(logT, J=max(j1, j2, 8), Q=1)
-        self.psi1 = self.psi1[:j1]
-        self.psi2 = self.psi2[:j2]
+        if dim > 2:
+            raise NotImplementedError('Only 1D and 2D scattering is supported')
+        self.signal_dim = dim
+        self.Q = Q
+        self.phi, self.psi1, self.psi2 = self.get_filters(logT, J=max(j1, j2, 8 if dim == 1 else 0), Q=self.Q, dim=self.signal_dim)
+        if dim == 1:
+            self.psi1 = self.psi1[:j1*self.Q]
+            self.psi2 = self.psi2[:j2*self.Q]
         self.phi = torch.from_numpy(self.phi)
         self.psi1 = torch.from_numpy(self.psi1)
         self.psi2 = torch.from_numpy(self.psi2)
         self._dim = None
 
     @staticmethod
-    def get_filters(logT, J, Q):
-        phi_f, psi1_f, psi2_f = scattering_filter_factory(2 ** logT, J, (Q, 1), 2 ** J)
-        phi_f = phi_f['levels'][0]
-        psi1_f = np.stack([psi['levels'][0] for psi in psi1_f])
-        psi2_f = np.stack([psi['levels'][0] for psi in psi2_f])
+    def get_filters(logT, J, Q, dim):
+        if dim == 1:
+            phi_f, psi1_f, psi2_f = filter_bank_1d(2 ** logT, J, (Q, 1), 2 ** J)
+            phi_f = phi_f['levels'][0]
+            psi1_f = np.stack([psi['levels'][0] for psi in psi1_f])
+            psi2_f = np.stack([psi['levels'][0] for psi in psi2_f])
+        elif dim == 2:
+            filters = filter_bank_2d(2 ** logT, 2 ** logT, J, L=Q)
+            phi_f = filters['phi']['levels'][0]
+            psi1_f = np.stack([psi['levels'][0] for psi in filters['psi']])
+            psi2_f = psi1_f.copy()
+        else:
+            raise ValueError('Invalid signal dimension')
         return phi_f.astype(np.float32), psi1_f.astype(np.float32), psi2_f.astype(np.float32)
 
-    @staticmethod
-    def convolve(signal, fourier_filter):
+    def convolve(self, signal, fourier_filter):
+        d = self.signal_dim
         if utils.is_torch_else_numpy(signal):
-            fourier_signal = torch.fft.fft(signal, dim=-1)
-            if signal.ndim <= 1 or fourier_filter.ndim <= 1:
-                fourier_conv = fourier_signal * fourier_filter
-            else:
-                fourier_conv = torch.einsum('...t,jt->...jt', fourier_signal, fourier_filter)
-            return torch.fft.ifft(fourier_conv)
+            fft = torch.fft.fft2 if d == 2 else torch.fft.fft
+            ifft = torch.fft.ifft2 if d == 2 else torch.fft.ifft
+            fourier_signal = fft(signal)
+            fourier_conv = fourier_signal.unsqueeze(-(d + 1)) * fourier_filter
+            return ifft(fourier_conv)
         else:
-            fourier_signal = scipy.fft.fft(signal, axis=-1)  # Uses scipy due to https://github.com/numpy/numpy/issues/17801
-            if signal.ndim <= 1 or fourier_filter.ndim <= 1:
-                fourier_conv = fourier_signal * fourier_filter
-            else:
-                fourier_conv = np.einsum('...t,jt->...jt', fourier_signal, fourier_filter)
-            return scipy.fft.ifft(fourier_conv)
+            fft = scipy.fft.fft2 if d == 2 else scipy.fft.fft
+            ifft = scipy.fft.ifft2 if d == 2 else scipy.fft.ifft
+            fourier_signal = fft(signal, axis=-1)  # Uses scipy due to https://github.com/numpy/numpy/issues/17801
+            fourier_conv = np.expand_dims(fourier_signal, -(d + 1)) * fourier_filter
+            return ifft(fourier_conv)
 
     @staticmethod
     @abstractmethod
@@ -128,7 +202,8 @@ class ScatABC(Energy):
     @property
     def dim(self):
         if self._dim is None:
-            self._dim = self(torch.zeros(2 ** self.logT, device=self.device)).shape[0]
+            signal_shape = 2 ** self.logT if self.signal_dim == 1 else (2 ** self.logT, 2 ** self.logT)
+            self._dim = self(torch.zeros(signal_shape, device=self.device)).shape[0]
         return self._dim
 
 
@@ -152,6 +227,110 @@ class ScatMean(ScatABC):
 
     def __repr__(self):
         return f'ScatMean({self.j1},{self.j2})'
+
+    @staticmethod
+    def nl(x):
+        return x.abs()
+
+
+class ScatMean2d(ScatABC):
+    def __call__(self, x):
+        expanded = False
+        if x.dim() == self.signal_dim:
+            x = x[None, ...]
+            expanded = True
+
+        N = x.shape[0]
+        Q = self.Q
+        s1 = self.nl(self.convolve(x, self.psi1))
+        assert len(self.psi1) == len(self.psi2) == Q * self.j1
+        axis = tuple(range(-self.signal_dim, 0))
+        s2 = torch.cat([self.nl(self.convolve(s1[:, j * Q:(j + 1) * Q], self.psi2[(j + 1) * Q:])).mean(axis=axis).view((N, -1)) for j in range(self.j1 - 1)], dim=1)
+        s_list = [s1.mean(axis=axis), s2]
+        # if self.signal_dim == 2:
+        #     s0 = self.nl(self.convolve(x, self.phi))
+        #     s_list = [s0.mean(axis=axis)] + s_list
+        phi = torch.cat(s_list, dim=1)
+
+        if expanded:
+            assert phi.shape[0] == 1
+            phi = phi.squeeze(0)
+
+        return phi
+
+    def __repr__(self):
+        d = '' if self.signal_dim == 1 else f'{self.signal_dim}d'
+        return f'ScatMean{d}({self.j1},{self.j2},{self.Q})'
+
+    @staticmethod
+    def nl(x):
+        return x.abs()
+
+
+class ScatKymatio(Energy):
+    def __init__(self, logT, J, Q, dim=1):
+        self.logT = logT
+        self.J = J
+        self.Q = Q
+        self.signal_dim = dim
+        if dim == 1:
+            self.scat = Scattering1D(J=J, shape=2 ** logT, Q=Q)
+        elif dim == 2:
+            self.scat = Scattering2D(J=J, shape=(2 ** logT, 2 ** logT), L=Q)
+        else:
+            raise ValueError('Invalid signal dimension')
+
+    def __repr__(self):
+        return f'ScatKymatio({self.J},{self.Q})'
+
+    def __call__(self, x):
+        expanded = False
+        if x.dim() == self.signal_dim:
+            x = x[None, ...]
+            expanded = True
+        phi = self.scat(x).mean(axis=tuple(range(-self.signal_dim, 0)))
+        if expanded:
+            assert phi.shape[0] == 1
+            phi = phi.squeeze(0)
+
+        return phi
+
+    @property
+    def dim(self):
+        T = 2 ** self.logT
+        x = torch.zeros(tuple(T for _ in range(self.signal_dim)))
+        return self(x).shape[-1]
+
+    def to(self, device: torch.device):
+        self.scat = self.scat.to(device)
+        return self
+
+    def cpu(self):
+        self.scat = self.scat.cpu()
+        return self
+
+
+class WaveletL1(ScatABC):
+    def __call__(self, x):
+        expanded = False
+        if x.dim() == self.signal_dim:
+            x = x[None, ...]
+            expanded = True
+
+        N = x.shape[0]
+        w1 = self.nl(self.convolve(x, self.psi1))
+        axis = tuple(range(-self.signal_dim, 0))
+        phi = w1.mean(axis=axis)
+
+        if expanded:
+            assert phi.shape[0] == 1
+            phi = phi.squeeze(0)
+
+        return phi
+
+    def __repr__(self):
+        d = '' if self.signal_dim == 1 else f'{self.signal_dim}d'
+        return f'WaveletL1{d}({self.j1},{self.Q})'
 
     @staticmethod
     def nl(x):
@@ -282,6 +461,30 @@ class ScatCovPCA(ScatCov):
         return self
 
 
+class PhaseHarmonicCovD(Energy):
+    def __init__(self, M, N, J, L, delta_j, delta_l, delta_k, nb_chunks, chunk_id, stdnorm=1, kmax=None):
+        self._J = J
+        self._L = L
+        self._delta_j = delta_j
+        self._delta_l = delta_l
+        self._delta_k = delta_k
+        self.phase_harmonics = PhaseHarmonics2d(M, N, J, L, delta_j, delta_l, delta_k, nb_chunks, chunk_id, stdnorm, kmax=kmax)
+
+    def __call__(self, x):
+        return self.phase_harmonics(x)
+
+    def __repr__(self):
+        return f'PhaseHarmonicCovD({self._J},{self._L},{self._delta_j},{self._delta_l},{self._delta_k})'
+
+    @property
+    def dim(self):
+        return 1 + 2 * len(self.phase_harmonics.this_wph['la1'])
+
+    def to(self, device: torch.device):
+        self.phase_harmonics = self.phase_harmonics.to(device)
+        return self
+
+
 class ScatSpectra(Energy):
     def __init__(self, logT, true_model_or_data: Model | torch.Tensor | None, include_phase: bool = True,
                  sigma2: torch.Tensor | None = None):
@@ -302,7 +505,7 @@ class ScatSpectra(Energy):
                 raise ValueError(f'Invalid type {type(true_model_or_data)} for true_model_or_data')
             assert true_samples.ndim == 3
             sigma2 = scatspectra.frontend.compute_sigma2(true_samples, self.J, Q, wav_type, wav_norm, high_freq, rpad,
-                                                         False, 1).mean(0, keepdims=True)
+                                                         False, 1).mean(0, keepdim=True)
         else:
             if true_model_or_data is not None:
                 print('Warning: true_model_or_data is ignored when sigma2 is given')
@@ -362,4 +565,39 @@ class ScatSpectra(Energy):
     def cpu(self):
         self.model = self.model.cpu()
         self.model.norm_layer.sigma = self.model.norm_layer.sigma.cpu()
+        return self
+
+
+class Combined(Energy):
+    def __init__(self, energies: list[Energy], weights: torch.Tensor | None = None):
+        if weights is None:
+            weights = torch.ones(len(energies))
+        else:
+            assert len(weights) == len(energies)
+        self.energies = energies
+        self.weights = weights
+        self._dim = sum(energy.dim for energy in energies)
+
+    def __call__(self, x):
+        return torch.cat([energy(x) * w for (energy, w) in zip(self.energies, self.weights)], dim=-1)
+
+    def __repr__(self):
+        r = f'Combined({",".join(repr(energy) for energy in self.energies)})'
+        if not all(self.weights == 1):
+            sw = [f'{w.item():.1E}' for w in self.weights]
+            r += f'({",".join(sw)})'
+        return r
+
+    @property
+    def dim(self):
+        return self._dim
+
+    def to(self, device: torch.device):
+        for energy in self.energies:
+            energy.to(device)
+        return self
+
+    def cpu(self):
+        for energy in self.energies:
+            energy.cpu()
         return self
